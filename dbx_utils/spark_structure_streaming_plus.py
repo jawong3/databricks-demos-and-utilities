@@ -1,22 +1,5 @@
 """
-This library hold
-Add-ons for developing Spark Structured Streaming pipelines on Databricks.
-
-The module has three entry points:
-
-- `live_session_window`: a session-window aggregation that emits each session
-  while it is still open, updating it every micro-batch, and again once it
-  closes. Importing the module also adds it as a DataFrame method.
-- `register_tckp_display`: returns `tckp_display`, a stand-in for `display()`
-  that gives streaming DataFrames a temporary checkpoint, so ad hoc displays
-  don't each need a new checkpoint path. It also adds `df.tckp_display()`.
-- `TableStreamingQueryListener`: a streaming query listener that appends query
-  start and stop events and per-batch progress to Unity Catalog tables, keeping
-  a full history to query or alert on.
-
-Examples assume a Databricks notebook, where `spark` and `display` are already
-defined and `from pyspark.sql import functions as F` has been run. Outputs are
-illustrative.
+This library hold add-ons for developing Spark Structured Streaming pipelines on Databricks
 """
 import shutil
 import uuid
@@ -249,64 +232,44 @@ class OpenClosedSessions(StatefulProcessor):
 
 def live_session_window(df: DataFrame, groupBy, agg, timeColumn, gapDuration) -> DataFrame:
     """
-    TODO: i might need to change how window.end is defined, its always window.end   = t + gapDuration
-    but it should be just t, the last record - but this would require the minimum window size
-
     Spark's native session_window function only emits each session when it passes
     its watermark threshold which may be too late for some use cases. This implementation
     emits a session as soon as possible with an open status and continously updates 
-
-
-    A native session window only emits a session once the watermark passes its
-    end, so nothing shows up until the session is over. This emits a row with
-    `status` `open` and the running aggregates for every session that gets
-    events in a micro-batch. It emits a final row with `status` `closed` once
-    the session ends: when the watermark passes its end, or when an event for
-    the same key arrives after the gap and starts a new session. Events older
-    than the watermark are dropped.
-
-    It runs on `transformWithStateInPandas` in update output mode, so the runtime
-    must support it, including the RocksDB state store it requires. Importing the
-    module also adds it as a DataFrame method, so `df.live_session_window(...)`
-    works.
-
-    The output has the group-by columns, `window` (a struct of `start` and `end`,
-    like a native session window), `session_start`, `session_end`, one column
-    per aggregate, and `status`. A session ends `gapDuration` after its last event.
+    until it passes it watermark threshold which at that point will emit a record with
+    a closed status. Unlike Spark's native session_window function, the aggregations
+    need to be defined alongside the window as they are kept as stateful variables.
 
     Arguments:
-        df (DataFrame): A streaming DataFrame with a watermark on `timeColumn`.
+        df (DataFrame): A streaming DataFrame with a watermark on `timeColumn`.=
         groupBy (str | pyspark.sql.Column): The column(s) which to group by for aggregations.
             Similarity to Spark, columns can be represented as strings or by `f.col(...)`
-        agg: Aggregate column(s) built with `F.sum`, `F.count`, `F.min` or
-            `F.max` over a plain column, or `F.count("*")`. Aliases are kept;
-            otherwise Spark's default names are used, such as `sum(amount)`.
-            `DISTINCT` aggregates aren't supported.
-        timeColumn: The event-time column, as a name or a plain column reference.
-        gapDuration (str): How long a session stays open without new events: a string
-            such as `"10 minutes"`, a `timedelta`, or an int of milliseconds.
-
-    Raises `ValueError` if an aggregate, column or `gapDuration` isn't in a
-    supported form.
+        agg (*exprs) : Same as `pyspark.sql.DataFrame.agg`, Columns or expressions to aggregate by.
+            Howover only sum(), count(), min(), max() are acceptable.
+        timeColumn (str | pyspark.sql.Column): The column name or column to use as the timestamp for windowing by time.
+        gapDuration (str): Literal string specifying the timeout of the session. eg. "10 minutes", "1 second"
 
     ```python
-    events = (spark.readStream.table("main.web.events")
-        .withWatermark("event_time", "10 minutes"))
+    (spark
+        .readStream()
+        .table('catalog.schema.table')
+        .withWatermark("event_time", "10 seconds"))
+        .live_session_window(
+            groupBy="user_id",
+            agg=(
+                f.sum("amount").alias("sum"),
+                f.count("*").alias("count")),
+            timeColumn=f.col("event_time"),
+            gapDuration="10 seconds")
+    ).display()
 
-    sessions = events.live_session_window(
-        groupBy="user_id",
-        agg=(F.sum("amount"), F.count("*").alias("events")),
-        timeColumn="event_time",
-        gapDuration="10 minutes",
-    )
-
-    +----------+------------+------------+------------+-------------------+-----+
-    |event_type|    query_id|      run_id|  query_name|         event_time|error|
-    +----------+------------+------------+------------+-------------------+-----+
-    |TERMINATED|74bdb97c-...|08d43c21-...|stream_query|2026-11-25 19:57:19| NULL|
-    |   STARTED|74bdb97c-...|08d43c21-...|stream_query|2026-11-25 19:56:32| NULL|
-    +----------+------------+------------+------------+-------------------+-----+
-
+    >>> +-------+------+-------------------+-------------------+---+-----+------+
+        |user_id|window|      session_start|        session_end|sum|count|status|
+        +-------+------+-------------------+-------------------+---+-----+------+
+        |      0| {...}|2016-03-11 09:00:07|2016-03-11 09:00:08|  2|    1|open  |
+        |      0| {...}|2016-03-11 09:00:07|2016-03-11 09:00:10| 13|    2|open  |
+        |      0| {...}|2016-03-11 09:00:07|2016-03-11 09:00:18| 26|    3|closed|
+        |      0| {...}|2016-03-11 09:00:22|2016-03-11 09:00:23|  3|    1|open  |
+        +-------+------+-------------------+-------------------+---+-----+------+
     ```
     """
 
