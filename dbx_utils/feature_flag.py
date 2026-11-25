@@ -1,32 +1,39 @@
-import functools
+"""
+This library holds a feature flag decorator catered towards Spark DataFrames & Transformations.
+It is designed as a logic gate for certain transformation which cannot be done on the orchestration
+layer
+"""
+from functools import wraps
 from pyspark.sql import DataFrame
 
 def feature_flag(flag, fallback = None):
     """
-    Decorated function which gatekeeps new transformations,
-    only added them into the transformation chain if the flag is True.
-    It handles 2 scenarios: the transformation is new or if its
-    replacing an older implementation referenced by fallback
+    For a call returning a Spark DataFrame, it will only execute the call
+    if the flag provided is `True`. Otherwise, it will invoke the callable
+    fallback is provided or do nothing - skipping the call.
 
-    Examples:
-        # 1. Brand New Feature
-        @feature_flag(DEDUPE)
-        def dedupe(df):
-            return df.dropDuplicates(["id"])
+    ```python
+    feature_toggle = None
 
-        # 2. Replacing Old Implementation
-        def rename_v0(df):
-            return df.withColumn("name", f.trim("name"))
+    def old_imple(df):
+        print("Using Old Implementation")
 
-        @feature_flag(USE_NEW_CLEAN_NAMES, fallback=rename_v0)
-        def rename_v1(df):
-            return df.withColumn("name", f.initcap(f.trim("name")))
+    @feature_flag(feature_toggle, old_imple)
+    def new_imple(df):
+        print("Using New Implementation")
 
-        df.transform(dedupe).transform(rename_v1)
+    feature_toggle = True
+    df.transform(new_imple)
+    >>> "Using New Implementation"
+
+    feature_toggle = False
+    df.transform(new_imple)
+    >>> "Using Old Implementation"
+    ```
     """
 
     def decorator(func):
-        @functools.wraps(func)
+        @wraps(func)
         def wrapper(df: DataFrame, *args, **kwargs) -> DataFrame:
             if flag:
                 return func(df, *args, **kwargs)
