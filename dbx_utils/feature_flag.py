@@ -12,6 +12,11 @@ def feature_flag(flag, fallback = None):
     if the flag provided is `True`. Otherwise, it will invoke the callable
     fallback is provided or do nothing - skipping the call.
 
+    Arguments:
+        flag (bool): Whether to use the function
+        fallback (Callable[[DataFrame], DataFrame]): Optional function which takes a Spark DataFrame,
+            transforms it and return another DataFrame. This function will be used if flag is `False`
+    
     ```python
     feature_toggle = None
 
