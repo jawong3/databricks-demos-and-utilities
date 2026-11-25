@@ -1,29 +1,11 @@
 """
-The script contains add-on functions to assist the developement of spark strucutre streaming piplines
-
-Below are the functions and classes available to use:
-
-    live_session_window - Instead of how a native session window behalves, sending
-        records into the micro-batch only after the window is closed off and passed it watermark,
-        a live session window will send on-going session windows to the micro-batch, continously
-        updating the event until its closed.
-
-    tckp_display - Displaying a streaming table requires a checkpoint path which cannot be reused.
-        This limitation makes developement tedious. This function creates a temporary checkpoint on the fly
-        behaving as display would on a regular table - without explicitly defining some checkpoint path
-
-    TableStreamingQueryListener - This streaming query listener implementation writes records on a
-        unity catalog table, maintaining full history which opens opportunities to create alerts.
+This library hold add-ons for developing Spark Structured Streaming pipelines on Databricks
 """
 import shutil
-import functools
 import uuid
 import pandas as pd
-import json
 import queue
-from collections import deque
 import threading
-import time
 import re
 from datetime import timedelta, datetime, timezone
 from typing import NamedTuple, Optional, Sequence, Tuple
@@ -32,6 +14,8 @@ from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as f
 from pyspark.sql.streaming import StatefulProcessor, StreamingQueryListener
 from pyspark.sql.types import *
+
+__all__ = ["TempCheckpointDisplay", "register_tckp_display", "TableStreamingQueryListener", "live_session_window"]
 
 # --------------------------------------------------------
 # Private Helper Functions & Variables
@@ -84,11 +68,6 @@ def _q(name: str) -> str:
 def _as_tuple(x):
     return (x,) if isinstance(x, (str, Column)) else tuple(x)
 
-
-def _ts(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
-
-
 def _int(x):
     try:
         return int(x)
@@ -120,28 +99,6 @@ def _parse_agg(c: Column, out_name: str, ddl_type: str) -> AggSpec:
     if not re.fullmatch(r"[\w.\- ]+", arg):
         raise ValueError(f"Aggregation input must be a plain column (got {arg!r} in {c!r})")
     return AggSpec(kind, arg, out_name, ddl_type)
-
-
-LIFECYCLE_SCHEMA = (StructType()
-    .add("event_type", StringType())
-    .add("query_id", StringType())
-    .add("run_id", StringType())
-    .add("query_name", StringType())
-    .add("event_time", TimestampType())
-    .add("error", StringType()))
-
-
-PROGRESS_SCHEMA = (StructType()
-    .add("query_id", StringType())
-    .add("query_name", StringType())
-    .add("batch_id", LongType())
-    .add("batch_timestamp", TimestampType())
-    .add("batch_duration", LongType())
-    .add("duration_breakdown", MapType(StringType(), LongType()))
-    .add("input_rows", LongType())
-    .add("sources", ArrayType(StringType()))
-    .add("files_outstanding", ArrayType(LongType()))
-    .add("bytes_outstanding", ArrayType(LongType())))
 
 
 # --------------------------------------------------------
@@ -275,20 +232,45 @@ class OpenClosedSessions(StatefulProcessor):
 
 def live_session_window(df: DataFrame, groupBy, agg, timeColumn, gapDuration) -> DataFrame:
     """
-    Session-window aggregation that emits 'open' progress rows and 'closed' final rows.
+    Spark's native session_window function only emits each session when it passes
+    its watermark threshold which may be too late for some use cases. This implementation
+    emits a session as soon as possible with an open status and continously updates 
+    until it passes it watermark threshold which at that point will emit a record with
+    a closed status. Unlike Spark's native session_window function, the aggregations
+    need to be defined alongside the window as they are kept as stateful variables.
 
-        df.live_session_window(
-            groupBy=(f.col("region"), f.col("user_id")),
-            timeColumn="event_time",
-            gapDuration="10 minutes",
-            agg=(f.sum("amount"), f.count("*"), f.min("amount").alias("lo"), f.max("amount")),
-        )
+    Arguments:
+        df (DataFrame): A streaming DataFrame with a watermark on `timeColumn`.=
+        groupBy (str | pyspark.sql.Column): The column(s) which to group by for aggregations.
+            Similarity to Spark, columns can be represented as strings or by `f.col(...)`
+        agg (*exprs) : Same as `pyspark.sql.DataFrame.agg`, Columns or expressions to aggregate by.
+            Howover only sum(), count(), min(), max() are acceptable.
+        timeColumn (str | pyspark.sql.Column): The column name or column to use as the timestamp for windowing by time.
+        gapDuration (str): Literal string specifying the timeout of the session. eg. "10 minutes", "1 second"
 
-    groupBy      Column(s)/name(s) to group by (expressions allowed; output name follows Spark).
-    timeColumn   Plain event-time column (the DataFrame needs a watermark on it).
-    gapDuration  '10 minutes' style string, timedelta, or int milliseconds.
-    agg          Column(s) built from f.sum / f.count / f.min / f.max over a plain column.
-                 Aliases are respected; otherwise default Spark names (e.g. 'sum(amount)').
+    ```python
+    (spark
+        .readStream()
+        .table('catalog.schema.table')
+        .withWatermark("event_time", "10 seconds"))
+        .live_session_window(
+            groupBy="user_id",
+            agg=(
+                f.sum("amount").alias("sum"),
+                f.count("*").alias("count")),
+            timeColumn=f.col("event_time"),
+            gapDuration="10 seconds")
+    ).display()
+
+    >>> +-------+------+-------------------+-------------------+---+-----+------+
+        |user_id|window|      session_start|        session_end|sum|count|status|
+        +-------+------+-------------------+-------------------+---+-----+------+
+        |      0| {...}|2016-03-11 09:00:07|2016-03-11 09:00:08|  2|    1|open  |
+        |      0| {...}|2016-03-11 09:00:07|2016-03-11 09:00:10| 13|    2|open  |
+        |      0| {...}|2016-03-11 09:00:07|2016-03-11 09:00:18| 26|    3|closed|
+        |      0| {...}|2016-03-11 09:00:22|2016-03-11 09:00:23|  3|    1|open  |
+        +-------+------+-------------------+-------------------+---+-----+------+
+    ```
     """
 
     # Since the functions signature mimics a Spark, parse 
@@ -336,22 +318,38 @@ DataFrame.live_session_window = live_session_window
 # --------------------------------------------------------
 class TempCheckpointDisplay:
     """
-    Wrap Databricks display() so streaming DataFrames get a managed checkpoint.
+    Using Spark's native display() function for DataStreamReader objects require
+    a `checkpointLocation` parameter to be provided, however the display() query
+    does not support recovering them checkpoints thus a new one must be invoke every call.
+    This implementation manages these checkpoints, creating temporary checkpoints automatically.
 
-    tckp_display = TempCheckpointDisplay(display, "/Volumes/path/to/adhoc_checkpoints")
+    Arguments:
+        display_fn (display): Spark's native display() function
+        base_path (str): The base directory for all temporary checkpoints
 
-    tckp_display(stream)    # Calls on display() using a temporary checkpoint
-    tckp_display.cleanup()  # Deletes all temporary checkpoints it has created during the session
-
-    Batch DataFrames bypass the checkpoint creation and just uses the native display()
+    ```python
+    tckp_display = TempCheckpointDisplay(display, '/Volumes/...')
+    ```
     """
 
     def __init__(self, display_fn, base_path):
         self._display = display_fn
-        self.base_path = base_path
+        self._base_path = base_path
         self._checkpoints = []
     
     def __call__(self, df=None, *args, name=None, base=None, **kwargs):
+        """
+        @public
+        Display DataStreamReader objects using a checkpoint generation on runtime.
+
+        Arguments:
+            name (str): Optional predefined naming for the temporary checkpoint
+            base (str): Optional alternative base directory instead of using the class base path
+
+        ```python
+        tckp_display(df)
+        ```
+        """
         # In case a non-streaming table is passed into the function,
         # just call display() normally
         if not getattr(df, "isStreaming", False) or "checkpointLocation" in kwargs:
@@ -365,31 +363,44 @@ class TempCheckpointDisplay:
             self._checkpoints.append(path)
             return self._display(df, *args, **kwargs)
 
-    # Delete all persisted checkpoints
     def cleanup(self):
+        """
+        Delete all temporary checkpoints created during the session
+        """
         for path in list(self._checkpoints):
-            self._remove(path)
-            self._checkpoints.remove(path)
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+                self._checkpoints.remove(path)
+                print(f"[tckp_display] removed {path}")
+            except Exception as e:
+                print(f"[tckp_display] could not remove {path}: {e}")
 
-    # Create the checkpoint path with either the predefined
-    # directory name and base path or generate a random directory 
     def _new_path(self, name, base):
-        root = (base or self.base_path).rstrip("/")
+        """
+        Create the checkpoint path with either the predefined
+        directory name and base path or generate a random directory 
+        """
+        root = (base or self._base_path).rstrip("/")
         return f"{root}/{name or uuid.uuid4().hex[:12]}"
 
-    @staticmethod
-    def _remove(path):
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-            print(f"[tckp_display] removed {path}")
-        except Exception as e:
-            print(f"[tckp_display] could not remove {path}: {e}")
 
+def register_tckp_display(display_fn, base_path):
+    """
+    Spark transformations are typically invoked using method chaining.
+    This function registers a TempCheckpointDisplay class as a callable method
+    which can be used within a chain.
 
-def register_tckp_display(display, base_path):
-    """Create a TempCheckpointDisplay and attach it to DataFrame,
-    so both tckp_display(df) and df.tckp_display() work."""
-    tckp = TempCheckpointDisplay(display, base_path)
+    Arguments:
+        display_fn (display): Spark's native display() function
+        base_path (str): The base directory for all temporary checkpoints
+    
+    ```python
+    tckp_display = register_tckp_display(display, '/Volumes/...')
+
+    df.tckp_display()
+    ```
+    """
+    tckp = TempCheckpointDisplay(display_fn, base_path)
 
     def _method(self, **kwargs):
         return tckp(self, **kwargs)
@@ -401,40 +412,108 @@ def register_tckp_display(display, base_path):
 # --------------------------------------------------------
 # Table Logging Streaming Query Listener
 # --------------------------------------------------------
+
+LIFECYCLE_SCHEMA = (StructType()
+    .add("event_type", StringType())
+    .add("query_id", StringType())
+    .add("run_id", StringType())
+    .add("query_name", StringType())
+    .add("event_time", TimestampType())
+    .add("error", StringType()))
+
+
+PROGRESS_SCHEMA = (StructType()
+    .add("query_id", StringType())
+    .add("query_name", StringType())
+    .add("batch_id", LongType())
+    .add("batch_timestamp", TimestampType())
+    .add("batch_duration", LongType())
+    .add("duration_breakdown", MapType(StringType(), LongType()))
+    .add("input_rows", LongType())
+    .add("sources", ArrayType(StringType()))
+    .add("files_outstanding", ArrayType(LongType()))
+    .add("bytes_outstanding", ArrayType(LongType())))
+
+
 class TableStreamingQueryListener(StreamingQueryListener):
-    def __init__(self, spark, lifecycle_table, progress_table, skip_empty_batches=True, polling_rate=2):
+    """
+    A StreamingQueryListener whose events related to StreamingQuery are logged onto managed tables.
+    Records are written on background threads as onQueryStarted cannot be blocked.
+    There are also seperate threads and an external function which handles onQueryProgress events as
+    there seems to be an unknown issue preventing both tables to be written using the same thread.
+
+    The lifecycle and progress tables will have the following schemas:
+
+    ```
+    +----------+------------+------------+------------+-------------------+-----+
+    |event_type|    query_id|      run_id|  query_name|         event_time|error|
+    +----------+------------+------------+------------+-------------------+-----+
+    |TERMINATED|74bdb97c-...|08d43c21-...|stream_query|2026-11-25 19:57:19| NULL|
+    |   STARTED|74bdb97c-...|08d43c21-...|stream_query|2026-11-25 19:56:32| NULL|
+    +----------+------------+------------+------------+-------------------+-----+
+
+    +------------+------------+--------+-------------------+--------------+------------------+----------+---------------------+-----------------+-----------------+
+    |    query_id|  query_name|batch_id|    batch_timestamp|batch_duration|duration_breakdown|input_rows|              sources|files_outstanding|bytes_outstanding|
+    +------------+------------+--------+-------------------+--------------+------------------+----------+---------------------+-----------------+-----------------+
+    |74bdb97c-...|stream_query|      0 |2026-11-25 19:56:45|          3467|             {...}|        35|[catalog.schema.df_0]|              [5]|         [534745]|
+    |74bdb97c-...|stream_query|      1 |2026-11-25 19:56:48|          2909|             {...}|        37|[catalog.schema.df_0]|              [4]|         [423123]|
+    +------------+------------+--------+-------------------+--------------+------------------+----------+---------------------+-----------------+-----------------+
+    ```
+
+    Arguments:
+        spark (SparkSession): The SparkSession whose StreamingQuery are to listened to
+        lifecycle_table (str): Path to the table which will store onQueryStarted and onQueryTerminated events
+        progress_table (str): Path to the table which will store onQueryProgress events
+        polling_rate (int) : In seconds, how long to wait before checking for another micro-batch being progressed (Default: 2)
+    """
+
+    def __init__(self, spark, lifecycle_table, progress_table, polling_rate=2):
         super().__init__()
+
         self._spark = spark
-        self.lifecycle_table = lifecycle_table
-        self.progress_table = progress_table
-        self.skip_empty_batches = skip_empty_batches
-        self.polling_rate = polling_rate
+        self._lifecycle_table = lifecycle_table
+        self._progress_table = progress_table
+        self._polling_rate = polling_rate
 
         self._table_names = {}
-        self._query_names = {str(q.id): q.name for q in spark.streams.active}
+        self._query_names = {str(q.id): q.name for q in self._spark.streams.active}
 
-        # Last batch id already logged per query, seeded so we don't re-log history.
+        # Last micro-batch which was already processed and logged per query,
+        # ensuring we don't log duplicate records
         self._last_batch = {}
-        for q in spark.streams.active:
+        for q in self._spark.streams.active:
             p = q.lastProgress
             self._last_batch[str(q.id)] = p.batchId if p else -1
 
+        # Create log tables if they do not exist yet
         for table, schema in [(lifecycle_table, LIFECYCLE_SCHEMA), (progress_table, PROGRESS_SCHEMA)]:
             if table is not None:
-                spark.createDataFrame([], schema).write.mode("ignore").saveAsTable(table)
+                self._spark.createDataFrame([], schema).write.mode("ignore").saveAsTable(table)
 
+        # Handles logging onQueryStarted and onQueryTerminated events
         self._queue = queue.Queue()
         self._thread = threading.Thread(target=self._drain, daemon=True, name="stream-listener-writer")
         self._thread.start()
 
-        # Progress poller: replaces onQueryProgress, which is not delivered reliably.
+        # Handles logging onQueryProgress which does not deliver reliably, replacing it with a custom function
         self._stop_event = threading.Event()
         self._poller = threading.Thread(target=self._poll, daemon=True, name="stream-listener-poller")
         self._poller.start()
 
     @classmethod
     def register(cls, spark, *args, **kwargs):
-        """Remove any listener of this class already on the session, then add a fresh one."""
+        """
+        Creates an instance of TableStreamingQueryListener while removing any
+        old listeners to avoid duplicate entries
+
+        ```python
+        my_listener = TableStreamingQueryListener.register(
+            spark,
+            lifecycle_table="cataqlog.schema.stream_lifecycle",
+            progress_table="cataqlog.schema.stream_progress",
+            polling_rate=3)
+        ```
+        """
         for old in cls._registered(spark):
             spark.streams.removeListener(old)
             try:
@@ -500,36 +579,56 @@ class TableStreamingQueryListener(StreamingQueryListener):
                     self._last_batch[qid] = event.batchId
 
             # wait() instead of sleep() so close() can interrupt immediately
-            self._stop_event.wait(self.polling_rate)
+            self._stop_event.wait(self._polling_rate)
 
     def flush(self):
+        """
+        Blocks until every log queued has been written.
+
+        ```python
+        my_listener.flush()
+        spark.table('catalog.schema.progress_table').display()
+        ```
+        """
         self._queue.join()
 
     def close(self, timeout=None):
-        # Stop the poller first so nothing new is enqueued, then drain and stop the writer.
+        """
+        Stop the writing threads, ensuring all logs queued is written prior.
+
+        Arguemnts:
+            timeout (float): Optional time in seconds to wait for each thread to stop.
+                If it isn't provided, it will wait indefinitely.
+        
+        ```python
+        my_listener.close()
+        ```
+        """
         self._stop_event.set()
-        self._poller.join(timeout=timeout)
-        self.flush()
+        self._poller.join(timeout)
         self._queue.put(None)
+        self._thread.join(timeout)
 
     def onQueryStarted(self, event):
+        """@private Called by Spark"""
         query_id = str(event.id)
         self._query_names[query_id] = event.name
 
-        self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
+        self._log(self._lifecycle_table, LIFECYCLE_SCHEMA,
             dict(
                 event_type  = "STARTED",
                 query_id    = query_id,
                 run_id      = str(event.runId),
                 query_name  = event.name,
-                event_time  = _ts(event.timestamp),
+                event_time  = datetime.fromisoformat(event.timestamp.replace("Z", "+00:00")),
                 error       = None
             ))
 
     def onQueryTerminated(self, event):
+        """@private Called by Spark"""
         query_id = str(event.id)
 
-        self._log(self.lifecycle_table, LIFECYCLE_SCHEMA,
+        self._log(self._lifecycle_table, LIFECYCLE_SCHEMA,
             dict(
                 event_type  = "TERMINATED",
                 query_id    = query_id,
@@ -541,27 +640,28 @@ class TableStreamingQueryListener(StreamingQueryListener):
         self._last_batch.pop(query_id, None)
 
     def onQueryProgress(self, event):
-        # Handled by the _poll thread (see ext_onQueryProgress).
+        """@private"""
+        #Handled by the _poll thread (see ext_onQueryProgress)
         pass
 
     def ext_onQueryProgress(self, event):
+        """@private Called by the poller; logs a progress row for one batch."""
         if event.get("id") and event.get("name"):
             self._query_names.setdefault(event["id"], event["name"])
 
-        if self.progress_table is None:
-            return
-        if self.skip_empty_batches and not event.get("numInputRows"):
+        # Skip on empty micro-batch or no progress table
+        if ((self._progress_table is None) or (not event.get("numInputRows"))):
             return
 
         sources = event.get("sources") or []
         metric = lambda k: [_int((s.get("metrics") or {}).get(k)) for s in sources]
 
         # Built lazily on the writer thread, because _source_name may run a SQL query.
-        self._log(self.progress_table, PROGRESS_SCHEMA, lambda: dict(
+        self._log(self._progress_table, PROGRESS_SCHEMA, lambda: dict(
             query_id            = event.get("id"),
             query_name          = event.get("name"),
             batch_id            = event.get("batchId"),
-            batch_timestamp     = _ts(event.get("timestamp")),
+            batch_timestamp     = datetime.fromisoformat(event.get("timestamp").replace("Z", "+00:00")),
             batch_duration      = event.get("batchDuration"),
             duration_breakdown  = event.get("durationMs"),
             input_rows          = event.get("numInputRows"),
@@ -569,6 +669,8 @@ class TableStreamingQueryListener(StreamingQueryListener):
             files_outstanding   = metric("numFilesOutstanding"),
             bytes_outstanding   = metric("numBytesOutstanding")
         ))
-
+    
     def onQueryIdle(self, event):
+        """@private"""
         pass
+
